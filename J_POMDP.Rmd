@@ -1,0 +1,904 @@
+---
+title: "POMDP for Information Seeking under Threat"
+output: html_document
+---
+
+<!--
+CONSOLIDATED FIXES (after a long debugging trail). Four real fixes are baked in;
+one proposed change was dropped as redundant.
+
+  [KEEP] FIX A — max_time cash-out (THE root-cause bug)
+         When C/I pushed the clock to max_time, done=TRUE but reward stayed 0
+         (only E cashes out). A rollout that Cs to the horizon returned 0,
+         discarding all fruit. Larger gamma -> cash-out point further out ->
+         almost always hits the horizon -> Q(C) systematically crushed. Fixed
+         in BOTH sim_step (planning) and env_step (reality): at max_time, if
+         alive, bank the fruit.
+
+  [KEEP] FIX B — greedy-with-cash-out rollout
+         The plain greedy rollout (C while safe, else E) never voluntarily
+         cashed out, so in safe regions it Cd to max_time. The cash-out rollout
+         compares "cash out now" vs "one more C". Correct once FIX A is in.
+
+  [KEEP] FIX C — normalized UCB
+         Raw Q-values differ by >100 while the exploration term is ~1-20, so
+         UCB degenerated to pure greedy (root counts like 198/1/1). Normalizing
+         Q to [0,1] restores real exploration and makes c scale-free; classic
+         c ~ sqrt(2) ~ 1.4 works.
+
+  [KEEP] FIX D — max_tree_depth
+         Cap tree expansion; beyond it, use rollout. Keeps the tree
+         shallow-and-wide so the root actions are well-sampled. Standard POMCP.
+
+  [DROP] "auto-scale c with reward magnitude" — redundant with FIX C, which
+         already makes c independent of reward scale.
+
+NOTE on c values: because of FIX C, the meaningful range is the classic UCT
+scale c ~ {0.5, 1.4, 3}, NOT the old {5, 10, 20}.
+-->
+
+```{r setup-params}
+library(dplyr)
+
+make_params <- function(overrides = list()) {
+  p <- list(
+      # --- TRUE world ---
+    v_animal_true   = 2,
+    true_d_init     = 30,
+       # --- Agent's known parameters ---
+    v_sub           = 2,
+    d_shelter       = 10,
+    sigma_obs       = 1.0,
+    sigma_proc_d    = 0.3,
+    sigma_proc_v    = 0.05,
+        # --- Reward and utility ---
+    fruit_reward    = 10.0,
+    capture_cost    = -1000,
+    rho             = 1.0,
+       # --- Time ---
+    dt_C            = 0.2,
+    dt_I            = 0.2,
+    dt_E            = 0.0,
+    max_time        = 40,
+      # --- POMCP ---
+    num_sims        = 100,
+    num_particles   = 100,
+    gamma           = 0.95,
+    thresh          = 1e-3,
+    c               = 1.4,      # FIX C: normalized-UCB scale 
+    obs_bucket      = 2.0,
+    max_tree_depth  = 10,       
+    prior_mean_d    = 30,
+    prior_sd_d      = 5,
+    prior_mean_v    = 3.0,
+    prior_sd_v      = 1.0
+  )
+  p <- modifyList(p, overrides)
+  if (!("prior_mean_d" %in% names(overrides))) {
+    p$prior_mean_d <- p$true_d_init
+  }
+  p
+}
+
+action_dt <- function(action, params) {
+  switch(action, "C" = params$dt_C, "I" = params$dt_I, "E" = params$dt_E)
+}
+```
+
+```{r real-state}
+#----real state---------------------------------------
+
+env_init <- function(params) {
+  list(t = 0, n = 0, a = 1, d = params$true_d_init)
+}
+
+capture_threshold <- function(action, v, params) {
+  base <- params$d_shelter * (v / params$v_sub - 1)
+  base + v * action_dt(action, params)
+}
+
+env_step <- function(state, action, params) {
+  dt <- action_dt(action, params)
+  d_thresh <- capture_threshold(action, params$v_animal_true, params)
+  caught   <- state$d <= d_thresh
+
+  reward <- 0
+  done   <- FALSE
+  obs    <- NA_real_
+
+  if (action == "C") {
+    state$n <- state$n + 1
+    if (caught) { reward <- params$capture_cost; done <- TRUE }
+  } else if (action == "I") {
+    obs <- rnorm(1, mean = state$d, sd = params$sigma_obs)
+    if (caught) { reward <- params$capture_cost; done <- TRUE }
+  } else if (action == "E") {
+    reward <- if (caught) params$capture_cost
+              else        (state$n ^ params$rho) * params$fruit_reward
+    done <- TRUE
+  }
+
+  state$t <- state$t + dt
+  state$d <- max(0, state$d - params$v_animal_true * dt)
+
+  # reaching the horizon alive is a forced cash-out, not a loss.
+  if (state$t >= params$max_time && !done) {
+    done <- TRUE
+    if (!caught) {
+      reward <- reward + (state$n ^ params$rho) * params$fruit_reward
+    }
+  }
+
+  list(state = state, reward = reward, obs = obs, done = done, caught = caught)
+}
+```
+
+```{r belief-state}
+#-------------belief state-------------------------------------
+
+belief_init <- function(params) {
+  data.frame(
+    d = rnorm(params$num_particles, params$prior_mean_d, params$prior_sd_d),
+    v = rnorm(params$num_particles, params$prior_mean_v, params$prior_sd_v)
+  )
+}
+
+belief_apply_survival <- function(particles, action, params) {
+  thresh_i <- capture_threshold(action, particles$v, params)
+  alive    <- particles$d > thresh_i
+  if (sum(alive) == 0) {
+    warning("All particles inconsistent with survival.")
+    return(particles)
+  }
+  survivors <- particles[alive, ]
+  idx <- sample.int(nrow(survivors), size = nrow(particles), replace = TRUE)
+  survivors[idx, ]
+}
+
+belief_propagate <- function(particles, action, params) {
+  N  <- nrow(particles)
+  dt <- action_dt(action, params)
+  if (dt == 0) return(particles)
+
+  sd_d <- params$sigma_proc_d * sqrt(dt)
+  sd_v <- params$sigma_proc_v * sqrt(dt)
+  particles$d <- pmax(0,   particles$d - particles$v * dt + rnorm(N, 0, sd_d))
+  particles$v <- pmax(0.1, particles$v +                    rnorm(N, 0, sd_v))
+  particles
+}
+
+belief_observe <- function(particles, obs, params) {
+  if (is.na(obs)) return(particles)
+  w <- dnorm(obs, mean = particles$d, sd = params$sigma_obs)
+  w <- if (sum(w) == 0) rep(1 / nrow(particles), nrow(particles))
+       else             w / sum(w)
+  idx <- sample.int(nrow(particles), size = nrow(particles),
+                    replace = TRUE, prob = w)  # importance resampling
+  particles[idx, ]
+}
+```
+
+```{r mcts}
+#----------------- MCTS---------------
+
+sample_hypothesis <- function(particles, observable, params) {
+  i <- sample.int(nrow(particles), 1)
+  list(
+    t     = observable$t,
+    n     = observable$n,
+    d_hyp = particles$d[i],
+    v_hyp = particles$v[i]
+  )
+}
+
+sim_step <- function(sim_state, action, params) {
+  dt <- action_dt(action, params)
+  d_thresh <- capture_threshold(action, sim_state$v_hyp, params)
+  caught   <- sim_state$d_hyp <= d_thresh
+
+  reward <- 0
+  done   <- FALSE
+  obs    <- NA_real_
+
+  if (action == "C") {
+    sim_state$n <- sim_state$n + 1
+    if (caught) { reward <- params$capture_cost; done <- TRUE }
+  } else if (action == "I") {
+    obs <- rnorm(1, mean = sim_state$d_hyp, sd = params$sigma_obs)
+    if (caught) { reward <- params$capture_cost; done <- TRUE }
+  } else if (action == "E") {
+    reward <- if (caught) params$capture_cost
+              else        (sim_state$n ^ params$rho) * params$fruit_reward
+    done <- TRUE
+  }
+
+  sim_state$t     <- sim_state$t + dt
+  sim_state$d_hyp <- max(0, sim_state$d_hyp - sim_state$v_hyp * dt)
+
+  # same forced cash-out at the horizon in planning.
+  if (sim_state$t >= params$max_time && !done) {
+    done <- TRUE
+    if (!caught) {
+      reward <- reward + (sim_state$n ^ params$rho) * params$fruit_reward
+    }
+  }
+
+  list(state = sim_state, reward = reward, obs = obs, done = done)
+}
+
+obs_to_bucket <- function(obs, params) {
+  if (is.na(obs)) return("Z")
+  sprintf("O%d", round(obs / params$obs_bucket))
+}
+```
+
+```{r rollout}
+#--------------rollout (greedy-with-cash-out)---------------------
+# Treats the sampled hypothesis (d_hyp, v_hyp) as ground truth and either
+# cashes out (E) or takes one more C, whichever is worth more. With FIX A in
+# sim_step, hitting the horizon now banks fruit instead of returning 0, so this
+# rollout gives correct, high-value leaf estimates in safe regions.
+
+rollout <- function(sim_state, time_elapsed, params) {
+  if (time_elapsed >= params$max_time)             return(0)  # horizon
+  if (params$gamma ^ time_elapsed < params$thresh) return(0)  # discount floor
+
+  q_E_now <- (sim_state$n ^ params$rho) * params$fruit_reward
+
+  d_thresh_C <- capture_threshold("C", sim_state$v_hyp, params)
+  if (sim_state$d_hyp <= d_thresh_C) {
+    a <- "E"                                   # next C lethal -> flee
+  } else {
+    q_C_then_E <- (params$gamma ^ params$dt_C) *
+                  ((sim_state$n + 1) ^ params$rho) * params$fruit_reward
+    a <- if (q_C_then_E > q_E_now) "C" else "E"
+  }
+
+  res <- sim_step(sim_state, a, params)
+  if (res$done) return(res$reward)
+
+  dt <- action_dt(a, params)
+  res$reward + (params$gamma ^ dt) *
+                rollout(res$state, time_elapsed + dt, params)
+}
+```
+
+```{r pomcp-tree}
+#---------------------POMCP TREE (FIX C normalized UCB + FIX D depth cap)----
+
+make_tree <- function() new.env(parent = emptyenv())
+
+expand_node <- function(tree, hkey, actions) {
+  tree[[hkey]] <- list(
+    values = setNames(rep(0,  length(actions)), actions),
+    counts = setNames(rep(0L, length(actions)), actions),
+    total  = 0L
+  )
+}
+
+# normalize Q to [0,1] before adding the exploration term, so a single
+# fixed c works regardless of reward scale (classic c ~ sqrt(2) ~ 1.4).
+ucb_action <- function(tree, hkey, c) {
+  node   <- tree[[hkey]]
+  acts   <- names(node$counts)
+  counts <- node$counts
+  if (any(counts == 0)) return(sample(acts[counts == 0], 1))
+
+  v  <- node$values
+  vr <- range(v)
+  v_norm <- if (diff(vr) > 0) (v - vr[1]) / diff(vr) else rep(0.5, length(v))
+
+  scores <- v_norm + c * sqrt(log(node$total) / counts)
+  sample(acts[scores == max(scores)], 1)
+}
+
+# `depth` caps tree expansion; beyond max_tree_depth use rollout.
+simulate_tree <- function(tree, sim_state, hkey, time_elapsed, params,
+                          depth = 0) {
+  if (time_elapsed >= params$max_time)             return(0)
+  if (params$gamma ^ time_elapsed < params$thresh) return(0)
+  if (depth >= params$max_tree_depth) {
+    return(rollout(sim_state, time_elapsed, params))
+  }
+
+  if (is.null(tree[[hkey]])) {
+    expand_node(tree, hkey, c("C", "I", "E"))
+    a   <- sample(c("C", "I", "E"), 1)
+    res <- sim_step(sim_state, a, params)
+    R   <- res$reward
+    if (!res$done) {
+      dt <- action_dt(a, params)
+      R  <- R + (params$gamma ^ dt) *
+                rollout(res$state, time_elapsed + dt, params)
+    }
+    node           <- tree[[hkey]]
+    node$counts[a] <- 1L
+    node$total     <- 1L
+    node$values[a] <- R
+    tree[[hkey]]   <- node
+    return(R)
+  }
+
+  a   <- ucb_action(tree, hkey, params$c)
+  res <- sim_step(sim_state, a, params)
+  R   <- res$reward
+
+  if (!res$done) {
+    dt <- action_dt(a, params)
+    child_hkey <- paste0(hkey, "|", a, "|", obs_to_bucket(res$obs, params))
+    R <- R + (params$gamma ^ dt) *
+              simulate_tree(tree, res$state, child_hkey,
+                            time_elapsed + dt, params, depth + 1)
+  }
+
+  node           <- tree[[hkey]]
+  node$counts[a] <- node$counts[a] + 1L
+  node$total     <- node$total + 1L
+  node$values[a] <- node$values[a] + (R - node$values[a]) / node$counts[a]
+  tree[[hkey]]   <- node
+  R
+}
+
+search_pomcp <- function(observable, particles, params) {
+  tree <- make_tree()
+  expand_node(tree, "root", c("C", "I", "E"))
+
+  for (i in seq_len(params$num_sims)) {
+    sim_state <- sample_hypothesis(particles, observable, params)
+    simulate_tree(tree, sim_state, "root", 0, params, depth = 0)
+  }
+
+  node     <- tree[["root"]]
+  best_act <- names(node$values)[which.max(node$values)]
+  list(action = best_act, q = node$values, counts = node$counts,
+       tree_size = length(ls(tree)))
+}
+```
+
+```{r episode-loop}
+#--------------------EPISODE LOOP-------------------
+
+run_episode <- function(params, verbose = FALSE) {
+  true_state <- env_init(params)
+  particles  <- belief_init(params)
+  traj <- list()
+
+  repeat {
+    observable <- list(t = true_state$t, n = true_state$n)
+
+    sr     <- search_pomcp(observable, particles, params)
+    action <- sr$action                       # plain argmax
+    qvals  <- sr$q
+
+    res <- env_step(true_state, action, params)
+
+    if (!res$done || !res$caught) {
+      particles <- belief_apply_survival(particles, action, params)
+      particles <- belief_propagate(particles, action, params)
+      if (action == "I") particles <- belief_observe(particles, res$obs, params)
+    }
+
+    traj[[length(traj) + 1]] <- data.frame(
+      t          = res$state$t,
+      action     = action,
+      Q_C        = unname(qvals["C"]),
+      Q_I        = unname(qvals["I"]),
+      Q_E        = unname(qvals["E"]),
+      n_C        = unname(sr$counts["C"]),
+      n_I        = unname(sr$counts["I"]),
+      n_E        = unname(sr$counts["E"]),
+      tree_size  = sr$tree_size,
+      mu_d       = mean(particles$d),
+      sd_d       = sd(particles$d),
+      mu_v       = mean(particles$v),
+      sd_v       = sd(particles$v),
+      true_d     = res$state$d,
+      obs        = res$obs,
+      reward     = res$reward,
+      caught     = res$caught,
+      done       = res$done,
+      stringsAsFactors = FALSE
+    )
+
+    if (verbose) {
+      cat(sprintf(
+        "t=%5.2f  a=%s  true_d=%5.2f  d=%5.2f±%4.2f  v=%4.2f±%4.2f  Q=(C:%7.1f I:%7.1f E:%7.1f)  tree=%4d  r=%5.0f%s\n",
+        res$state$t, action, res$state$d,
+        mean(particles$d), sd(particles$d),
+        mean(particles$v), sd(particles$v),
+        qvals["C"], qvals["I"], qvals["E"], sr$tree_size, res$reward,
+        if (res$caught) "  CAUGHT" else ""
+      ))
+    }
+
+    true_state <- res$state
+    if (res$done) break
+  }
+
+  do.call(rbind, traj)
+}
+```
+
+```{r grid-search}
+#--------------grid search --------
+
+library(future)
+library(future.apply)
+
+eval_cell <- function(i, param_grid, n_episodes, base_params) {
+  param_names <- names(param_grid)
+  cur <- base_params
+  for (nm in param_names) cur[[nm]] <- param_grid[[nm]][i]
+  if ("true_d_init" %in% param_names &&
+      !("prior_mean_d" %in% param_names)) {
+    cur$prior_mean_d <- cur$true_d_init
+  }
+
+  ep_rewards <- numeric(n_episodes)
+  ep_fruits  <- numeric(n_episodes)
+  n_I_used   <- numeric(n_episodes)
+  n_C_used   <- numeric(n_episodes)
+  survived_v <- logical(n_episodes)
+
+  for (e in seq_len(n_episodes)) {
+    tr <- run_episode(cur)
+    ep_rewards[e] <- sum(tr$reward, na.rm = TRUE)
+    n_I_used[e]   <- sum(tr$action == "I")
+    n_C_used[e]   <- sum(tr$action == "C")
+    surv          <- !any(tr$caught)
+    survived_v[e] <- surv
+    ep_fruits[e]  <- if (surv) sum(tr$action == "C") else 0
+  }
+
+  p_surv <- mean(survived_v)
+  row <- as.data.frame(as.list(param_grid[i, , drop = FALSE]))
+  row$mean_reward  <- mean(ep_rewards)
+  row$sd_reward    <- sd(ep_rewards)
+  row$survival_pct <- 100 * p_surv
+  row$se_survival  <- 100 * sqrt(p_surv * (1 - p_surv) / n_episodes)
+  row$mean_fruits  <- mean(ep_fruits)
+  row$sd_fruits    <- sd(ep_fruits)
+  row$mean_n_I     <- mean(n_I_used)
+  row$sd_n_I       <- sd(n_I_used)
+  row$mean_n_C     <- mean(n_C_used)
+  row
+}
+
+run_grid_search <- function(param_grid, n_episodes, base_params,
+                            workers = NULL) {
+  if (is.null(workers)) {
+    sc <- Sys.getenv("SLURM_CPUS_PER_TASK")
+    workers <- if (nzchar(sc)) {
+      as.integer(sc)
+    } else {
+      omp <- Sys.getenv("OMP_NUM_THREADS")
+      if (nzchar(omp)) as.integer(omp) else parallel::detectCores()
+    }
+  }
+  cat("GRID SEARCH WORKERS =", workers, "\n")              
+  message(sprintf("Grid search: %d cells on %d workers (multicore).",
+                  nrow(param_grid), workers))
+
+  plan(multicore, workers = workers)                        
+  on.exit(plan(sequential), add = TRUE)
+
+  rows <- future.apply::future_lapply(
+    seq_len(nrow(param_grid)),
+    eval_cell,
+    param_grid  = param_grid,
+    n_episodes  = n_episodes,
+    base_params = base_params,
+    future.seed = TRUE
+  )
+  do.call(rbind, rows)
+}
+```
+
+
+```{r fig-shared-setup}
+library(dplyr)
+library(ggplot2)
+library(future)
+library(future.apply)
+
+# ---- precision (raise for final figures) ----
+FIG_N_EP  <- 5
+FIG_NSIMS <- 100
+FIG_NPART <- 100
+
+# ---- ONE evaluator used by both figures: a parameter point -> 3 metrics + SE
+eval_point <- function(overrides, n_ep = FIG_N_EP) {
+  cur <- make_params(c(overrides, list(num_sims = FIG_NSIMS,
+                                       num_particles = FIG_NPART,
+                                       max_tree_depth = 10, c = 1.4)))
+  nC <- nI <- numeric(n_ep); surv <- logical(n_ep)
+  for (e in seq_len(n_ep)) {
+    tr <- run_episode(cur)
+    nC[e]   <- sum(tr$action == "C")
+    nI[e]   <- sum(tr$action == "I")
+    surv[e] <- !any(tr$caught)
+  }
+  p <- mean(surv)
+  data.frame(
+    mean_n_I     = mean(nI), se_n_I  = sd(nI) / sqrt(n_ep),
+    mean_n_C     = mean(nC), se_n_C  = sd(nC) / sqrt(n_ep),
+    survival_pct = 100 * p,  se_surv = 100 * sqrt(p * (1 - p) / n_ep)
+  )
+}
+
+# ---- ONE worker-detection scheme (3-layer), used by both collections ----
+detect_workers <- function() {
+  sc <- Sys.getenv("SLURM_CPUS_PER_TASK")
+  if (nzchar(sc)) return(as.integer(sc))
+  omp <- Sys.getenv("OMP_NUM_THREADS")
+  if (nzchar(omp)) return(as.integer(omp))
+  parallel::detectCores()
+}
+
+# ---- ONE shared theme ----
+theme_paper <- theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+        axis.line  = element_line(color = "black", linewidth = 0.4),
+        axis.ticks = element_line(color = "black", linewidth = 0.4),
+        strip.text = element_text(face = "bold", size = 10),
+        plot.title = element_text(face = "bold", size = 14))
+
+# ---- ONE long-reshape helper (renamed to avoid any collision) ----
+# Pulls the three metric columns of a wide result frame into long form.
+to_long_metrics <- function(df, extra_cols = character(0)) {
+  base_cols <- c(extra_cols)
+  spec <- list(
+    c("mean_n_I",     "se_n_I",  "Information-seeks (n_I)"),
+    c("mean_n_C",     "se_n_C",  "Fruits collected (n_C)"),
+    c("survival_pct", "se_surv", "Survival (%)")
+  )
+  do.call(rbind, lapply(spec, function(s) {
+    out <- df[, base_cols, drop = FALSE]
+    out$value  <- df[[s[1]]]
+    out$se     <- df[[s[2]]]
+    out$metric <- s[3]
+    out
+  }))
+}
+
+metric_levels <- c("Information-seeks (n_I)",
+                   "Fruits collected (n_C)",
+                   "Survival (%)")
+```
+
+```{r fig1-maineffect-collect}
+#============================================================================
+# FIGURE 1 data — main effects (single slice).
+# Each parameter swept while the OTHERS stay at a fixed baseline.
+#============================================================================
+PM_BASE <- list(gamma = 0.95)
+
+build_pm_grid <- function() {
+  rows <- list()
+  # sweep 1: observation noise (v_sub=1.5 mildly risky, fruit=10)
+  for (so in c(0.5, 1.0, 2.0, 4.0))
+    rows[[length(rows)+1]] <- list(param = "sigma_obs", x = so,
+      ov = c(PM_BASE, list(sigma_obs = so, v_sub = 1.5, fruit_reward = 10)))
+  # sweep 2: fruit reward (v_sub=1.5, sigma_obs=1.0)
+  for (fr in c(10, 50, 100))
+    rows[[length(rows)+1]] <- list(param = "fruit_reward", x = fr,
+      ov = c(PM_BASE, list(fruit_reward = fr, v_sub = 1.5, sigma_obs = 1.0)))
+  # sweep 3: subject speed (sigma_obs=1.0, fruit=10)
+  for (vs in c(1.0, 1.5, 2.0, 2.5, 3.0))
+    rows[[length(rows)+1]] <- list(param = "v_sub", x = vs,
+      ov = c(PM_BASE, list(v_sub = vs, sigma_obs = 1.0, fruit_reward = 10)))
+  rows
+}
+PM_GRID <- build_pm_grid()
+
+workers <- detect_workers()
+cat("FIG1 WORKERS =", workers, "\n")
+cat("fork supported:", future::supportsMulticore(), "\n")
+plan(multicore, workers = workers)
+
+pm_results <- future.apply::future_lapply(
+  PM_GRID,
+  function(pt) cbind(param = pt$param, x = pt$x, eval_point(pt$ov)),
+  future.seed = TRUE
+)
+plan(sequential)
+
+PM <- do.call(rbind, pm_results)
+cat("FIG1 grid points:", length(PM_GRID), "\n")
+print(PM)
+```
+
+```{r fig1-maineffect-plot, fig.width=13, fig.height=11}
+PM_long <- to_long_metrics(PM, extra_cols = c("param", "x"))
+
+PM_long$param  <- factor(PM_long$param,
+                         levels = c("sigma_obs", "fruit_reward", "v_sub"),
+                         labels = c("sigma[obs]", "Fruit~reward", "v[sub]"))
+PM_long$metric <- factor(PM_long$metric, levels = metric_levels)
+
+metric_cols <- c("Information-seeks (n_I)" = "#1a9641",
+                 "Fruits collected (n_C)"  = "#e66101",
+                 "Survival (%)"            = "#d7191c")
+
+fig1 <- ggplot(PM_long, aes(x = x, y = value, color = metric, group = metric)) +
+  geom_line(linewidth = 0.8) +
+  geom_pointrange(aes(ymin = value - se, ymax = value + se), size = 0.4) +
+  scale_color_manual(values = metric_cols) +
+  facet_grid(metric ~ param, scales = "free",
+             labeller = labeller(param = label_parsed)) +
+  labs(title = "Main effects: task parameters on model behavior",
+       x = "Parameter value", y = NULL) +
+  theme_paper + theme(legend.position = "none")
+
+print(fig1)
+ggsave("param_metric_grid.png", fig1, width = 13, height = 11,
+       dpi = 300, bg = "white")
+```
+
+```{r fig2-interaction-collect}
+#============================================================================
+# FIGURE 2 data — interactions (double slice).
+# Each sweep crossed with a grouping variable:
+#   sigma_obs, fruit_reward -> grouped by v_sub
+#   v_sub                   -> grouped by sigma_obs
+#============================================================================
+DS_BASE   <- list(gamma = 0.95, fruit_reward = 10, sigma_obs = 1.0)
+VSUB_GRID <- c(1.5, 2.0, 2.5)
+SOBS_GRID <- c(0.5, 1.0, 2.0)
+
+build_ds_grid <- function() {
+  rows <- list()
+  # Sweep A: sigma_obs x v_sub  (group_var = v_sub)
+  for (vs in VSUB_GRID)
+    for (so in c(0.5, 1.0, 2.0, 4.0))
+      rows[[length(rows)+1]] <- list(param = "sigma_obs", x = so,
+        group_var = "v_sub", group = vs,
+        ov = list(gamma = DS_BASE$gamma, sigma_obs = so, v_sub = vs,
+                  fruit_reward = DS_BASE$fruit_reward))
+  # Sweep B: fruit_reward x v_sub  (group_var = v_sub)
+  for (vs in VSUB_GRID)
+    for (fr in c(10, 50, 100))
+      rows[[length(rows)+1]] <- list(param = "fruit_reward", x = fr,
+        group_var = "v_sub", group = vs,
+        ov = list(gamma = DS_BASE$gamma, fruit_reward = fr, v_sub = vs,
+                  sigma_obs = DS_BASE$sigma_obs))
+  # Sweep C: v_sub x sigma_obs  (group_var = sigma_obs)
+  for (so in SOBS_GRID)
+    for (vs in c(1.0, 1.5, 2.0, 2.5, 3.0))
+      rows[[length(rows)+1]] <- list(param = "v_sub", x = vs,
+        group_var = "sigma_obs", group = so,
+        ov = list(gamma = DS_BASE$gamma, v_sub = vs, sigma_obs = so,
+                  fruit_reward = DS_BASE$fruit_reward))
+  rows
+}
+DS_GRID <- build_ds_grid()
+
+workers <- detect_workers()
+cat("FIG2 WORKERS =", workers, "\n")
+plan(multicore, workers = workers)
+
+ds_results <- future.apply::future_lapply(
+  DS_GRID,
+  function(pt) cbind(param = pt$param, x = pt$x,
+                     group_var = pt$group_var, group = pt$group,
+                     eval_point(pt$ov)),
+  future.seed = TRUE
+)
+plan(sequential)
+
+DS <- do.call(rbind, ds_results)
+cat("FIG2 grid points:", length(DS_GRID), "\n")
+print(head(DS, 12))
+```
+
+```{r fig2-interaction-plot, fig.width=14, fig.height=11}
+# ---- reshape, then build a clear "group_var = value" label ----
+DS_long <- to_long_metrics(DS, extra_cols = c("param", "x",
+                                              "group_var", "group"))
+
+# human-readable grouping label, e.g. "v[sub]==1.5" / "sigma[obs]==0.5"
+# (parsed as plotmath so the subscripts render)
+DS_long$group_label <- ifelse(
+  DS_long$group_var == "v_sub",
+  paste0("v[sub]==", DS_long$group),
+  paste0("sigma[obs]==", DS_long$group)
+)
+# order labels: all v_sub levels first, then all sigma_obs levels
+lab_levels <- c(
+  paste0("v[sub]==",     sort(unique(DS$group[DS$group_var == "v_sub"]))),
+  paste0("sigma[obs]==", sort(unique(DS$group[DS$group_var == "sigma_obs"])))
+)
+DS_long$group_label <- factor(DS_long$group_label, levels = lab_levels)
+
+DS_long$param  <- factor(DS_long$param,
+                         levels = c("sigma_obs", "fruit_reward", "v_sub"),
+                         labels = c("sigma[obs]~(group:~v[sub])",
+                                    "Fruit~reward~(group:~v[sub])",
+                                    "v[sub]~(group:~sigma[obs])"))
+DS_long$metric <- factor(DS_long$metric, levels = metric_levels)
+
+# enough distinct colours for ALL labels (3 v_sub + 3 sigma_obs = up to 6);
+# viridis auto-scales to however many are present.
+fig2 <- ggplot(DS_long, aes(x = x, y = value,
+                            color = group_label, group = group_label)) +
+  geom_line(linewidth = 0.8) +
+  geom_pointrange(aes(ymin = value - se, ymax = value + se),
+                  size = 0.35, position = position_dodge(width = 0.04)) +
+  scale_color_viridis_d(name = "grouping value", labels = scales::parse_format()) +
+  facet_grid(metric ~ param, scales = "free",
+             labeller = labeller(param = label_parsed)) +
+  labs(title = "Interactions: task-parameter effects vs a grouping variable",
+       subtitle = "Each column is grouped by a different variable (see facet titles); other params at baseline",
+       x = "Parameter value", y = NULL) +
+  theme_paper + theme(legend.position = "bottom")
+
+print(fig2)
+ggsave("double_slice_grid.png", fig2, width = 14, height = 11,
+       dpi = 300, bg = "white")
+```
+
+```{r fig-cross-check}
+#============================================================================
+# Free sanity check: FIG1 and FIG2 share parameter points (e.g. sigma_obs
+# sweep at v_sub=1.5). They won't be byte-identical (independent parallel RNG
+# streams) but should agree within a couple of SEs. Big disagreement => a bug
+# in one of the grid definitions.
+#============================================================================
+cmp <- merge(
+  subset(PM, param == "sigma_obs")[, c("x", "mean_n_I", "mean_n_C", "survival_pct")],
+  subset(DS, param == "sigma_obs" & group == 1.5)[, c("x", "mean_n_I", "mean_n_C", "survival_pct")],
+  by = "x", suffixes = c(".fig1", ".fig2")
+)
+cat("Cross-check: sigma_obs sweep, FIG1 vs FIG2 (v_sub=1.5)\n")
+print(cmp)
+```
+
+```{r optimal-hparam-setup}
+#============================================================================
+# OPTIMAL SUBJECTIVE-HYPERPARAMETER SEARCH  (Interpretation A)
+#----------------------------------------------------------------------------
+# c, gamma, fruit_reward are the AGENT's subjective cognitive parameters, NOT
+# environment settings. Different agents value fruit / weight the future /
+# explore differently. There is therefore no "reward-optimal" value: the
+# agent's own fruit_reward would make reward self-referential (a larger
+# subjective fruit value inflates the reward it is scored by).
+#
+# So we score configurations by OBJECTIVE behaviour only:
+#   survival_pct  — did it actually escape alive?
+#   mean_n_C      — how many fruits did it actually pick?
+# combined into:
+#   objective_yield = (survival_pct/100) * mean_n_C
+#     = expected fruits actually carried to safety per episode.
+#   (Captured episodes yield nothing objectively, so survival-weighting
+#    naturally penalises "greedy high-fruit_reward gets you killed".)
+#
+# The OBJECTIVE WORLD is held fixed across all configs (v_animal_true,
+# true_d_init, v_sub, etc.) — we are asking "which cognition is best adapted
+# to THIS world", so the world cannot move. Only subjective params vary.
+#
+# Parallel (multicore), self-contained.
+#============================================================================
+library(dplyr)
+library(future)
+library(future.apply)
+
+# ---- precision ----
+OPT_N_EP  <- 5
+OPT_NSIMS <- 100
+OPT_NPART <- 100
+
+# ---- FIXED objective world (NOT searched — this is the real environment) ----
+# Everything here describes the true task; subjective params are layered on top.
+FIXED_WORLD <- list(
+  v_animal_true = 2,      # true predator speed
+  true_d_init   = 30,     # true starting distance
+  v_sub         = 2,      # subject's (true) speed capability
+  d_shelter     = 10,
+  sigma_obs     = 1.0,    # true observation noise of the task
+  sigma_proc_d  = 0.3,
+  sigma_proc_v  = 0.05,
+  dt_C = 0.2, dt_I = 0.2, dt_E = 0.0,
+  max_time = 40,
+  prior_mean_d  = 30,     # biased prior: agent slightly UNDER-estimates the
+                          # true distance (30), i.e. believes the predator is
+                          # a bit closer than it is -> mildly cautious start.
+  prior_sd_d    = 5       # prior uncertainty on distance (held fixed)
+)
+
+# ---- evaluator: one config -> objective metrics (NO reward used to score) ----
+eval_config <- function(overrides, n_ep = OPT_N_EP) {
+  cur <- make_params(c(FIXED_WORLD, overrides,
+                       list(num_sims = OPT_NSIMS, num_particles = OPT_NPART,
+                            max_tree_depth = 10)))
+  nC <- numeric(n_ep); surv <- logical(n_ep)
+  for (e in seq_len(n_ep)) {
+    tr <- run_episode(cur)
+    nC[e]   <- sum(tr$action == "C")
+    surv[e] <- !any(tr$caught)
+  }
+  p <- mean(surv)
+  data.frame(
+    survival_pct    = 100 * p,
+    se_survival     = 100 * sqrt(p * (1 - p) / n_ep),
+    mean_n_C        = mean(nC),
+    se_n_C          = sd(nC) / sqrt(n_ep),
+    objective_yield = p * mean(nC)            # survival-weighted fruit
+  )
+}
+
+# ---- the subjective search space ----
+opt_grid <- expand.grid(
+  c            = c(0.5, 1.4, 3.0),   # exploration (normalized-UCB scale)
+  gamma        = c(0.90, 0.95, 0.99),# subjective patience / temporal discount
+  fruit_reward = c(10, 50, 100)      # subjective value of a fruit
+)
+cat("Configurations to evaluate:", nrow(opt_grid), "\n")
+```
+
+```{r optimal-hparam-search}
+# ---- worker detection (same 3-layer scheme as the rest of the project) ----
+workers <- {
+  sc <- Sys.getenv("SLURM_CPUS_PER_TASK")
+  if (nzchar(sc)) as.integer(sc) else {
+    omp <- Sys.getenv("OMP_NUM_THREADS")
+    if (nzchar(omp)) as.integer(omp) else parallel::detectCores()
+  }
+}
+cat("OPT SEARCH WORKERS =", workers, "\n")
+cat("fork supported:", future::supportsMulticore(), "\n")
+plan(multicore, workers = workers)
+
+opt_rows <- future.apply::future_lapply(
+  seq_len(nrow(opt_grid)),
+  function(i) {
+    ov <- list(c = opt_grid$c[i], gamma = opt_grid$gamma[i],
+               fruit_reward = opt_grid$fruit_reward[i])
+    cbind(opt_grid[i, , drop = FALSE], eval_config(ov))
+  },
+  future.seed = TRUE
+)
+plan(sequential)
+
+OPT <- do.call(rbind, opt_rows)
+```
+
+```{r optimal-hparam-report}
+library(dplyr)
+
+# ---- rank by the objective yield (survival-weighted fruit) ----
+cat("=== Top configurations by objective_yield (survival x fruit) ===\n")
+OPT %>% arrange(desc(objective_yield)) %>% head(12) %>% print()
+
+cat("\n=== Best single configuration ===\n")
+best <- OPT %>% arrange(desc(objective_yield)) %>% slice(1)
+print(best)
+cat(sprintf(
+  "\nBest: c=%.1f, gamma=%.2f, fruit_reward=%g  ->  survival=%.0f%%, n_C=%.1f, yield=%.1f\n",
+  best$c, best$gamma, best$fruit_reward,
+  best$survival_pct, best$mean_n_C, best$objective_yield))
+
+# ---- diagnostic: does subjective fruit_reward overshoot? (your hypothesis) ----
+# Higher subjective fruit value can make the agent greedier -> caught more ->
+# objective yield can DROP even though it "wants" fruit more. Show the trend.
+cat("\n=== Effect of subjective fruit_reward (averaged over c, gamma) ===\n")
+OPT %>% group_by(fruit_reward) %>%
+  summarize(mean_survival = mean(survival_pct),
+            mean_n_C      = mean(mean_n_C),
+            mean_yield    = mean(objective_yield),
+            .groups = "drop") %>%
+  print()
+cat("If mean_survival falls and mean_yield peaks at an intermediate\n",
+    "fruit_reward, that confirms: over-valuing fruit gets the agent killed.\n")
+
+# ---- marginal effect of each subjective parameter on objective yield ----
+cat("\n=== Marginal objective_yield by gamma ===\n")
+OPT %>% group_by(gamma) %>%
+  summarize(mean_yield = mean(objective_yield),
+            mean_survival = mean(survival_pct), .groups="drop") %>% print()
+
+cat("\n=== Marginal objective_yield by c ===\n")
+OPT %>% group_by(c) %>%
+  summarize(mean_yield = mean(objective_yield),
+            mean_survival = mean(survival_pct), .groups="drop") %>% print()
+```
